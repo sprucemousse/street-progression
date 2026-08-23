@@ -166,10 +166,11 @@ function computeState() {
   let bankroll = cfg.startingBankroll;
   let deficit = 0;
   let recoveryStep = 0;   // consecutive losses since deficit was last cleared
+  let lockedRecoveryStake = 0; // stake for the current recovery leg — fixed until it clears or another loss resets it
   let paused = false;
   let paperWinStreak = 0;
   const rows = [];
-  const target = cfg.startingBankroll * (1 + cfg.profitTargetPct / 100);
+  const profitTarget = cfg.startingBankroll * (1 + cfg.profitTargetPct / 100);
   let targetHit = false;
   let targetHitAtSpin = null;
 
@@ -199,10 +200,7 @@ function computeState() {
     let stake;
     if (recoveryStep === 0) stake = baseUnit;
     else if (recoveryStep === 1) stake = baseUnit * 2;
-    else {
-      const target = deficit + baseUnit;
-      stake = deficit > 0 ? target / (2 * (12 - N_COVERED)) : baseUnit * 3;
-    }
+    else stake = lockedRecoveryStake; // FIXED for this leg — does not shrink as wins come in
     stake = roundToChip(stake);
 
     const change = won ? stake * (12 - N_COVERED) : -stake * N_COVERED;
@@ -211,46 +209,36 @@ function computeState() {
     rows.push({ idx: i+1, number: n, street: st, type: 'bet', won, stake, bankrollAfter: bankroll });
 
     if (won) {
-      if (recoveryStep <= 1) { deficit = 0; recoveryStep = 0; }
+      if (recoveryStep <= 1) { deficit = 0; recoveryStep = 0; lockedRecoveryStake = 0; }
       else {
         deficit -= stake * (12 - N_COVERED);
-        if (deficit <= 0) { deficit = 0; recoveryStep = 0; }
-        else recoveryStep++;
+        if (deficit <= 0) { deficit = 0; recoveryStep = 0; lockedRecoveryStake = 0; }
+        else recoveryStep++; // keep using the SAME lockedRecoveryStake next round
       }
     } else {
       deficit += stake * N_COVERED;
       recoveryStep++;
+      // a loss always re-plans the recovery: lock in a fresh stake sized to clear the NEW total over ~2 wins
+      const planTarget = deficit + baseUnit;
+      lockedRecoveryStake = roundToChip(planTarget / (2 * (12 - N_COVERED)));
       if (recoveryStep >= PAUSE_AFTER_LOSSES) { paused = true; paperWinStreak = 0; }
     }
 
     // only allow the target to trigger once fully clear of any recovery (deficit paid off)
-    if (bankroll >= target && deficit === 0 && !paused) {
+    if (bankroll >= profitTarget && deficit === 0 && !paused) {
       targetHit = true;
       targetHitAtSpin = i + 1;
     }
   });
 
-  // figure out next round
+  // figure out next round's stake for display — must match exactly what computeState will actually charge
   let nextStake = null;
-  if (paused) {
-    // still show what the stake would be if betting, for reference
-    if (recoveryStep <= 1) nextStake = baseUnit * (recoveryStep + 1);
-    else {
-      const target = deficit + baseUnit;
-      nextStake = deficit > 0 ? target / (2 * (12 - N_COVERED)) : baseUnit * 3;
-    }
-    nextStake = roundToChip(nextStake);
-  } else {
-    if (recoveryStep === 0) nextStake = baseUnit;
-    else if (recoveryStep === 1) nextStake = baseUnit * 2;
-    else {
-      const target = deficit + baseUnit;
-      nextStake = deficit > 0 ? target / (2 * (12 - N_COVERED)) : baseUnit * 3;
-    }
-    nextStake = roundToChip(nextStake);
-  }
+  if (recoveryStep === 0) nextStake = baseUnit;
+  else if (recoveryStep === 1) nextStake = baseUnit * 2;
+  else nextStake = lockedRecoveryStake; // same fixed stake the loop above would use
+  nextStake = roundToChip(nextStake);
 
-  return { rows, bankroll, paused, recoveryStep, paperWinStreak, nextStake, targetHit, targetHitAtSpin, target };
+  return { rows, bankroll, paused, recoveryStep, paperWinStreak, nextStake, targetHit, targetHitAtSpin, target: profitTarget };
 }
 
 function renderNumberPad() {
