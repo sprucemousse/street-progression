@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>9-Street Pause System</title>
+<title>9-Street True 2-Win Recovery</title>
 <style>
   :root {
     --bg: #0f1720; --panel: #17212b; --panel-2: #1e2a37; --border: #2a3a49;
@@ -30,10 +30,12 @@
   .phase-badge { display:inline-block; padding:4px 10px; border-radius:20px; font-size:.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.04em; margin-bottom:10px; }
   .phase-bet { background:rgba(47,158,100,.18); color:var(--green); }
   .phase-pause { background:rgba(224,165,58,.18); color:var(--warn); }
+  .phase-danger { background:rgba(214,69,69,.18); color:var(--red); }
 
   .next-bet { text-align:center; padding:20px; }
   .next-bet .amount { font-size:2.4rem; font-weight:700; color:var(--accent); }
   .next-bet .amount.pause { color: var(--warn); font-size: 1.6rem; }
+  .next-bet .amount.danger { color: var(--red); }
   .next-bet .sub2 { font-size:.85rem; color:var(--muted); margin-top:4px; }
   .stat-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:16px; }
   .stat { background:var(--panel-2); border-radius:8px; padding:10px; text-align:center; }
@@ -59,16 +61,19 @@
   .l { color:var(--red); font-weight:600; }
   .tag { font-size:.68rem; padding:1px 6px; border-radius:10px; background:var(--panel-2); }
 
-  .warning { background:rgba(224,165,58,.1); border:1px solid var(--warn); color:var(--warn); border-radius:8px; padding:12px 14px; font-size:.8rem; line-height:1.4; margin-bottom:16px; }
+  .warning { background:rgba(214,69,69,.10); border:1px solid var(--red); color:var(--red); border-radius:8px; padding:12px 14px; font-size:.8rem; line-height:1.45; margin-bottom:16px; }
+  .warning.amber { background:rgba(224,165,58,.1); border-color:var(--warn); color:var(--warn); }
   .empty-hint { color:var(--muted); font-size:.85rem; text-align:center; padding:10px 0; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>9-Street Pause System</h1>
-  <div class="sub">Fixed 9-street coverage (1,2,4,5,7,9,10,11,12 — never rolls). Double on the 1st loss; from the 2nd loss, stake targets the deficit plus one extra base unit, split across roughly 2 wins. After 6 losses in a row, stop betting and just watch until 3 real wins happen in a row, then resume exactly where the recovery left off.</div>
-  <div class="warning" style="margin-bottom:0;">This is the safest version tested — zero busts across 21 real datasets, including a proper train/holdout check. It is also slow: typical sessions gain roughly 5–20%, not fast wins. No progression removes the house edge.</div>
-  <div style="height:16px;"></div>
+  <h1>9-Street True 2-Win Recovery</h1>
+  <div class="sub">Fixed 9-street coverage (1,2,4,5,7,9,10,11,12 — never rolls). Double on the 1st loss; from the 2nd loss, the stake is LOCKED so that exactly 2 wins at that same stake fully clear the deficit. Any new loss re-plans the stake for a bigger deficit. After 3 losses in a row, stop betting and watch until 3 real wins happen, then resume exactly where the recovery left off.</div>
+
+  <div class="warning">
+    <strong>Known risk — read before playing:</strong> this recovery formula has caused genuine bankroll-destroying losses in testing — twice, both times on sessions from the same casino (Southampton), at stake sizes from £0.10 to £0.20 and bankrolls from £200 to £400. The drawdown in the worst case reached over 5× the starting bankroll. No bankroll size we tested made it fully safe against that pattern. This app will not stop you from playing through a losing streak that exceeds your bankroll — it has no built-in cap on how large the stake can grow. Only use this with money you can afford to lose entirely in a single session.
+  </div>
 
   <!-- SETUP -->
   <div class="card" id="setupCard">
@@ -76,7 +81,7 @@
     <div class="row">
       <div>
         <label for="baseUnit">Base stake (£)</label>
-        <input type="number" id="baseUnit" value="0.20" min="0.05" step="0.05">
+        <input type="number" id="baseUnit" value="0.10" min="0.05" step="0.05">
       </div>
       <div>
         <label for="bankroll">Starting bankroll (£)</label>
@@ -92,6 +97,7 @@
   <div id="sessionArea" class="hidden">
 
     <div class="warning hidden" id="targetHitBanner" style="background:rgba(47,158,100,.12); border-color:var(--green); color:var(--green);"></div>
+    <div class="warning amber hidden" id="dangerBanner"></div>
 
     <div class="card">
       <span class="phase-badge" id="phaseBadge">Betting</span>
@@ -140,8 +146,9 @@
 const RED_NUMBERS = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
 const MAIN_STREETS = new Set([1,2,4,5,7,9,10,11,12]); // fixed coverage, never changes
 const N_COVERED = 9;
-const PAUSE_AFTER_LOSSES = 6;
+const PAUSE_AFTER_LOSSES = 3;
 const RESUME_AFTER_WINS = 3;
+const DANGER_STAKE_THRESHOLD = 20; // flag prominently once a single stake would exceed this many pounds/street
 
 function streetOf(n) {
   if (n === 0) return null;
@@ -157,6 +164,14 @@ function roundToChip(stake, increment = 0.10) {
   return Math.max(increment, Math.round(rounded * 100) / 100);
 }
 
+// For recovery stakes specifically: round UP, never down, so the "+1 base unit" profit
+// margin is never lost to rounding — 2 wins at this stake will always recover the
+// deficit plus at least one full base unit, never less.
+function roundUpToChip(stake, increment = 0.10) {
+  const rounded = Math.ceil(stake / increment) * increment;
+  return Math.max(increment, Math.round(rounded * 100) / 100);
+}
+
 let cfg = null;      // { baseUnit, startingBankroll, profitTargetPct }
 let spins = [];      // raw entered results in order
 
@@ -166,10 +181,11 @@ function computeState() {
   let bankroll = cfg.startingBankroll;
   let deficit = 0;
   let recoveryStep = 0;   // consecutive losses since deficit was last cleared
+  let lockedStake = 0;    // stake for the CURRENT recovery leg — fixed until it clears or another loss re-plans it
   let paused = false;
   let paperWinStreak = 0;
   const rows = [];
-  const target = cfg.startingBankroll * (1 + cfg.profitTargetPct / 100);
+  const profitTarget = cfg.startingBankroll * (1 + cfg.profitTargetPct / 100);
   let targetHit = false;
   let targetHitAtSpin = null;
 
@@ -178,16 +194,14 @@ function computeState() {
     const won = st !== null && MAIN_STREETS.has(st);
 
     if (targetHit) {
-      // session's target already reached — still log what happens, but treat as no-bet
       rows.push({ idx: i+1, number: n, street: st, type: 'target-hit', won, stake: null, bankrollAfter: null });
       return;
     }
 
     if (paused) {
-      let advanced = false;
       if (won) {
         paperWinStreak++;
-        if (paperWinStreak >= RESUME_AFTER_WINS) { paused = false; paperWinStreak = 0; advanced = true; }
+        if (paperWinStreak >= RESUME_AFTER_WINS) { paused = false; paperWinStreak = 0; }
       } else {
         paperWinStreak = 0;
       }
@@ -195,14 +209,11 @@ function computeState() {
       return;
     }
 
-    // actively betting
+    // actively betting — stake is LOCKED for this recovery leg (true 2-win behaviour)
     let stake;
     if (recoveryStep === 0) stake = baseUnit;
     else if (recoveryStep === 1) stake = baseUnit * 2;
-    else {
-      const target = deficit + baseUnit;
-      stake = deficit > 0 ? target / (2 * (12 - N_COVERED)) : baseUnit * 3;
-    }
+    else stake = lockedStake;
     stake = roundToChip(stake);
 
     const change = won ? stake * (12 - N_COVERED) : -stake * N_COVERED;
@@ -211,46 +222,36 @@ function computeState() {
     rows.push({ idx: i+1, number: n, street: st, type: 'bet', won, stake, bankrollAfter: bankroll });
 
     if (won) {
-      if (recoveryStep <= 1) { deficit = 0; recoveryStep = 0; }
+      if (recoveryStep <= 1) { deficit = 0; recoveryStep = 0; lockedStake = 0; }
       else {
         deficit -= stake * (12 - N_COVERED);
-        if (deficit <= 0) { deficit = 0; recoveryStep = 0; }
-        else recoveryStep++;
+        if (deficit <= 0) { deficit = 0; recoveryStep = 0; lockedStake = 0; }
+        else recoveryStep++; // keep using the SAME lockedStake next round
       }
     } else {
       deficit += stake * N_COVERED;
       recoveryStep++;
+      // a loss always re-plans: lock a fresh stake sized to clear the NEW total over 2 more wins
+      // rounds UP so the +1-base-unit profit margin always survives, never rounds away to £0
+      const planTarget = deficit + baseUnit;
+      lockedStake = roundUpToChip(planTarget / (2 * (12 - N_COVERED)));
       if (recoveryStep >= PAUSE_AFTER_LOSSES) { paused = true; paperWinStreak = 0; }
     }
 
-    // only allow the target to trigger once fully clear of any recovery (deficit paid off)
-    if (bankroll >= target && deficit === 0 && !paused) {
+    if (bankroll >= profitTarget && deficit === 0 && !paused) {
       targetHit = true;
       targetHitAtSpin = i + 1;
     }
   });
 
-  // figure out next round
+  // figure out next round's stake for display — must match exactly what computeState will actually charge
   let nextStake = null;
-  if (paused) {
-    // still show what the stake would be if betting, for reference
-    if (recoveryStep <= 1) nextStake = baseUnit * (recoveryStep + 1);
-    else {
-      const target = deficit + baseUnit;
-      nextStake = deficit > 0 ? target / (2 * (12 - N_COVERED)) : baseUnit * 3;
-    }
-    nextStake = roundToChip(nextStake);
-  } else {
-    if (recoveryStep === 0) nextStake = baseUnit;
-    else if (recoveryStep === 1) nextStake = baseUnit * 2;
-    else {
-      const target = deficit + baseUnit;
-      nextStake = deficit > 0 ? target / (2 * (12 - N_COVERED)) : baseUnit * 3;
-    }
-    nextStake = roundToChip(nextStake);
-  }
+  if (recoveryStep === 0) nextStake = baseUnit;
+  else if (recoveryStep === 1) nextStake = baseUnit * 2;
+  else nextStake = lockedStake;
+  nextStake = roundToChip(nextStake);
 
-  return { rows, bankroll, paused, recoveryStep, paperWinStreak, nextStake, targetHit, targetHitAtSpin, target };
+  return { rows, bankroll, paused, recoveryStep, paperWinStreak, nextStake, targetHit, targetHitAtSpin, target: profitTarget };
 }
 
 function renderNumberPad() {
@@ -275,6 +276,7 @@ function refreshUI() {
   const amountEl = document.getElementById('nextAmount');
   const subEl = document.getElementById('nextSub');
   const targetBanner = document.getElementById('targetHitBanner');
+  const dangerBanner = document.getElementById('dangerBanner');
 
   if (s.targetHit) {
     targetBanner.classList.remove('hidden');
@@ -282,6 +284,14 @@ function refreshUI() {
     targetBanner.textContent = `🎯 Target reached at spin ${s.targetHitAtSpin} — bankroll hit ${fmt(s.target)} (+${cfg.profitTargetPct}%). Net so far: +${fmt(pl)}. This is a good point to stop.`;
   } else {
     targetBanner.classList.add('hidden');
+  }
+
+  const inDanger = !s.paused && !s.targetHit && s.nextStake > DANGER_STAKE_THRESHOLD;
+  if (inDanger) {
+    dangerBanner.classList.remove('hidden');
+    dangerBanner.textContent = `⚠️ This stake (${fmt(s.nextStake)}/street, ${fmt(s.nextStake*N_COVERED)} total) is significantly above base. This is the exact pattern that caused real losses in testing. Consider stopping here instead of placing this bet.`;
+  } else {
+    dangerBanner.classList.add('hidden');
   }
 
   if (s.targetHit) {
@@ -300,12 +310,12 @@ function refreshUI() {
     subEl.textContent = `If still betting, next stake would be ${fmt(s.nextStake)}/street`;
   } else {
     badge.textContent = s.recoveryStep === 0 ? 'Place a bet' : `Recovering — loss ${s.recoveryStep} of ${PAUSE_AFTER_LOSSES} before pause`;
-    badge.className = 'phase-badge phase-bet';
+    badge.className = inDanger ? 'phase-badge phase-danger' : 'phase-badge phase-bet';
     phaseText.textContent = s.recoveryStep === 0
       ? 'Place this stake on all 9 covered streets, then enter the result.'
-      : 'Still betting — stake is sized to recover the deficit plus a little profit over ~2 wins.';
+      : 'This stake is LOCKED for this recovery leg — 2 wins at this exact amount will clear the deficit.';
     amountEl.textContent = 'BET — ' + fmt(s.nextStake) + ' / street';
-    amountEl.className = 'amount';
+    amountEl.className = inDanger ? 'amount danger' : 'amount';
     subEl.textContent = `Total on table: ${fmt(s.nextStake * N_COVERED)} across 9 streets`;
   }
 
@@ -316,7 +326,6 @@ function refreshUI() {
   plEl.className = 'val ' + (pl > 0 ? 'pos' : pl < 0 ? 'neg' : '');
   document.getElementById('statSpins').textContent = spins.length;
 
-  // covered streets display (static, but show which are covered vs not for clarity)
   const coveredDiv = document.getElementById('coveredStreets');
   coveredDiv.innerHTML = '';
   for (let idx = 1; idx <= 12; idx++) {
@@ -326,7 +335,6 @@ function refreshUI() {
     coveredDiv.appendChild(chip);
   }
 
-  // history table
   const body = document.getElementById('historyBody');
   body.innerHTML = '';
   document.getElementById('historyEmpty').classList.toggle('hidden', s.rows.length > 0);
@@ -348,7 +356,7 @@ function refreshUI() {
 
 function startSession() {
   cfg = {
-    baseUnit: parseFloat(document.getElementById('baseUnit').value) || 0.20,
+    baseUnit: parseFloat(document.getElementById('baseUnit').value) || 0.10,
     startingBankroll: parseFloat(document.getElementById('bankroll').value) || 0,
     profitTargetPct: parseFloat(document.getElementById('profitTarget').value) || 10
   };
